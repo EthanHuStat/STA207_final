@@ -1,0 +1,407 @@
+---
+title: "Study of Covid-19 Vaccine's Effect on Death Rate and Efficacy among Time"
+author: "Yichen Hu 918973999"
+date: "March 13, 2022"
+output:
+  html_document:
+    number_sections: yes
+    toc: true
+    toc_depth: 2
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r warning=FALSE, echo=FALSE, message=FALSE}
+library(readxl)
+library(mgcv)
+library(dplyr)
+library(zoo)
+library(MASS)
+library(stringr)
+library(ggplot2)
+library(ggpubr)
+```
+
+# Abstract
+&emsp;&emsp;In this study, we use GAM(general additive model) to study whether vaccine rate reduces Covid-19 death rate considering time effect at the same time. We also study vaccine's efficacy against infection and death with time. We find vaccine rate decreases death rate significantly and so does some economic and public health measures. We find the inner death rate shows an overall decline while there are two major rebound in Alpha and Delta waves. We also find vaccine efficacy against infection decreases with time while efficacy against death shows first decreasing and increasing trend, indicating vaccine has long-term protection against death despite waning protection against infection.
+
+# Introduction
+&emsp;&emsp;Covid-19 is a major global public health crisis. Millions have lost lives during the past two years and Tens of millions are experiencing long-Covid. Every one's lives change during the pandemic. Fortunately, vaccine is our best weapon against the virus and saves many lives. At the same time, the virus seems to become less lethal as we go into Omicron wave. Is the decline of death rate due to high vaccine rate or virus itself? Is vaccine still effectively protect us with longer time?
+<br>&emsp;&emsp;For the first question, we download a data set from Github [1]. This data set contains daily cases, deaths, vaccine status and some other infrastructure measures like economic and public health conditions of different countries. We will model daily death rate in this problem.
+<br>&emsp;&emsp;For the second question, we download a data set from CDC [2]. This data set contains weekly data of cases and deaths of vaccine and unvaccinated groups of different ages. This data set comes from a health surveillance system of 26 jurisdictions, representing 67% total US population. Even if the data are incomplete, they are enough to study the efficacy.
+
+# Data Preprocessing
+&emsp;&emsp;Since many countries do not have the ability to monitor the pandemic, we only use countries of Europe and North America if their populations are more than 10 million. Some other countries still have such ability and this is only for simplicity.
+<br>&emsp;&emsp;In the first data set, we have a lot of missing values and unimportant variables. We keep the important ones and fill zero to missing numeric variables about cases and deaths. Final we drop all NA values. This will only influence the first dozens of days of the pandemic because many countries do not have recordings in the early stage.
+<br>&emsp;&emsp;We know there is a 7-day trend in cases and lag between infection and death. Then we compute moving average and lagged death rate. We compute the 7-days moving average of cases and death and compute the death rate with a 10-day lag. That is, We assume average time from case to death is 10 days for simplicity. We find some daily cases or deaths are below zero. We replace them with 0. We also find some countries have death rate more than one. This may be due to low data quality, and we choose to drop recordings with death rate more than 20%.
+<br>&emsp;&emsp;We define 2020-03-08 the starting date. Then we compute day lags between other date and this date to get numeric date variable. For instance, 2020-03-10 will be 2.
+<br>&emsp;&emsp;For the second data set, we compute the efficacy $\frac{p_1-p_2}{p_1}$ where $p_1$ is the rate of unvaccinated and $p_2$ is the rate of vaccinated.
+```{r echo=FALSE}
+data1 = read.csv("../data/owid-covid-data.csv")
+data2 = filter(data1, continent%in%c('Europe','North America'), population>5000000)
+data2$new_cases_per_million[is.na(data2$new_cases_per_million)] = 0
+data2$new_deaths_per_million[is.na(data2$new_cases_per_million)] = 0
+data2$people_vaccinated_per_hundred[is.na(data2$people_vaccinated_per_hundred)] = 0
+data2$people_fully_vaccinated_per_hundred[is.na(data2$people_fully_vaccinated_per_hundred)] = 0
+data2$total_boosters_per_hundred[is.na(data2$total_boosters_per_hundred)] = 0
+data3 = na.omit(data2)
+data3 = data3[,!colnames(data3)%in%c("continent","population")]
+remove(data1)
+remove(data2)
+```
+
+```{r echo=FALSE}
+data3$case = ave(data3$new_cases_per_million, data3$location, 
+                 FUN= function(x) rollmean(x, k=7, na.pad=T))
+data3$case[abs(data3$case)<1e-6] = 0
+data3$case[data3$case < 0] = 0
+data3$death = ave(data3$new_deaths_per_million, data3$location, 
+                 FUN= function(x) rollmean(x, k=7, na.pad=T))
+data3$death[abs(data3$death)<1e-6] = 0
+data3$death[data3$death < 0] = 0
+data3$loggdp = log(data3$gdp_per_capita)
+data3 = data3 %>%                            
+  group_by(location) %>%
+  dplyr::mutate(case10=lag(case, n=10, default=NA)) 
+data3$death_rate = data3$death/data3$case10
+data3 = na.omit(data3)
+data3$date = as.Date(data3$date, format="%m/%d/%Y")
+start_date = min(data3$date)
+data3$date_numeric = as.numeric(difftime(data3$date, start_date, units='days'))
+data3 = data3[data3$death_rate<0.2,]
+```
+
+```{r echo=FALSE}
+us_data = read_excel("../data/weekly.xlsx",sheet="case_vaccine")
+us_data$week_no = as.numeric(str_sub(as.character(us_data$mmwr_week), start=-2))
+us_data$age_group = as.factor(us_data$age_group)
+us_data$efficacy = 1-(us_data$vaccinated_with_outcome/us_data$fully_vaccinated_population)/(us_data$unvaccinated_with_outcome/us_data$unvaccinated_population)
+
+us_data_death = read_excel("../data/weekly.xlsx",sheet="death_vaccine")
+us_data_death$week_no = as.numeric(str_sub(as.character(us_data_death$mmwr_week), start=-2))
+us_data_death$age_group = as.factor(us_data_death$age_group)
+us_data_death$efficacy = 1-(us_data_death$vaccinated_with_outcome/us_data_death$fully_vaccinated_population)/(us_data_death$unvaccinated_with_outcome/us_data_death$unvaccinated_population)
+```
+
+# Data Visualization
+&emsp;&emsp;We first pick Denmark, Italy, UK and US to look their vaccine progress and death rates.
+```{r echo=FALSE}
+cor_matrix = cor(data3[!colnames(data3)%in%c("case10","death_rate","date_numeric","location","date","gdp_per_capita")])
+Var1 = c()
+Var2 = c()
+Correlation = c()
+for(i in 1:17){
+    for(j in (i+1):18){
+        if(abs(cor_matrix[i,j])>0.5){
+            Var1 = c(Var1, colnames(cor_matrix)[i])
+            Var2 = c(Var2, colnames(cor_matrix)[j])
+            Correlation = c(Correlation, cor_matrix[i,j])
+        }
+    }
+}
+High_cor = data.frame(Var1, Var2, Correlation)
+blank_theme = theme(
+    text=element_text(family="Times", size=12),
+    plot.background = element_rect(fill="white"),
+    axis.ticks = element_blank(),
+    plot.title=element_text(size=12, face="bold", hjust=0.5)
+  )
+```
+
+```{r echo=FALSE, warning=FALSE, fig.height=6, fig.width=8, fig.align ='center'}
+data_eda = data3 %>%
+  group_by(location) %>%
+  arrange(median_age,aged_65_older,aged_70_older,loggdp,extreme_poverty,cardiovasc_death_rate,diabetes_prevalence,hospital_beds_per_thousand,life_expectancy,human_development_index) %>%
+  filter(row_number()==1)
+data1 = data3[data3$location%in%c("United States","United Kingdom","Denmark","Italy"),]
+fig1= ggplot(data=data1, aes(x=date_numeric, y=death_rate, color=location)) +       
+  geom_line(aes(group=location))  + blank_theme +
+  ggtitle("Death Rate with Time") +
+  labs(x="Days from 3/8/2020",y="Death Rate")
+fig2 = ggplot(data=data1, aes(x=date_numeric, y=people_fully_vaccinated_per_hundred, color=location)) +       
+  geom_line(aes(group=location))  + blank_theme +
+  ggtitle("Vaccine Progress") +
+  labs(x="Days from 3/8/2020",y="Fully Vaccinated Percent")
+ggarrange(fig1, fig2, ncol=1, nrow=2)
+```
+<br>&emsp;&emsp;We can see different countries vary much in death rate and vaccine progress. USA started vaccine program very early, while its vaccine rate fell behind much after a period of time. Denmark has high vaccine rate and relative low death rate.
+<br>&emsp;&emsp;We can also see death rate seems to have some fluctuations, while the main trend is going downwards. Different countries may have different rebound level in different waves. Maybe this is due to their vaccine progress
+<br>&emsp;&emsp;So it is natural for us to think about relation between vaccine rate and death rate and what causes the fluctuations.
+
+<br>&emsp;&emsp;We then have a look at efficacy of vaccine in US.
+```{r echo=FALSE, warning=FALSE, fig.height=6, fig.width=8, fig.align ='center'}
+fig3 = ggplot(data=us_data, aes(x=week_no, y=efficacy, color=age_group)) +       
+  geom_line(aes(group=age_group)) + geom_point() + blank_theme +
+  ggtitle("Efficacy against Infection with Time of Different Age Group") +
+  labs(x="Week Number",y="Efficiceny against Infection")
+fig4 = ggplot(data=us_data_death, aes(x=week_no, y=efficacy, color=age_group)) +       
+  geom_line(aes(group=age_group)) + geom_point() + blank_theme +
+  ggtitle("Efficacy against Death with Time of Different Age Group") +
+  labs(x="Week Number",y="Efficiceny against Death")
+ggarrange(fig3, fig4, ncol=1, nrow=2)
+```
+<br>We can observe efficacy against infection seems to drop among time in all age groups, while there is no such pattern in efficacy against death. This may indicate vaccines remain power against death even if with less power against infection. Also we observe age group 12-17 has huge fluctuation in some weeks. This is because there are few death within this group.
+
+# Methodology
+## Model Formulation
+&emsp;&emsp;It is very natural to use binomial regression, specifically logistics regression, to model our rates.
+$$log\frac{p}{1-p}=X\beta$$
+<br>&emsp;&emsp;However, generalized linear model can only deal with linear relationship while some variables may have nonlinear, even complex impact on our responsive variable. For instance, date may have impact on death rate because different variants may dominate for different periods. We think Delta variant has higher death rate while Omicron has lower death rate. And we cannot guarantee the next variant will be less lethal. So the impact of date will be complex. Since there is no seasonal trend on variants, it is also hard for us to use time series models.
+<br>&emsp;&emsp;To address this problem, we use generalized additive model [3] [4] to model our data.
+$$log\frac{p}{1-p}=X\beta+f(Z)$$
+where $X\beta$ is the linear influence part while $f(Z)$ is nonlinear part. $f(Z)$ is estimated by smoothing methods like splines. 
+<br>&emsp;&emsp;The overall parameters are estimated by iterative weighted least squares and back fitting [5]. Hopefully, the choice of smoothing methods and tuning parameters is optimized in R package mgcv otherwise we may use cross validation to select them. 
+
+## Discussion on Causal Inference
+&emsp;&emsp;In our first problem, there is no binary treatment variable. Vaccine progress and pandemic are moving gradually. So there cannot be a so-called outcome for a country, unlike for individual, on which we can study whether he/she dies or not.
+<br>&emsp;&emsp;In our second problem, it seems plausible to take vaccine status yes/no as the treatment. If we want to use causal inference in our problem, our focus should be based on individual's infection, death and vaccine status. However, we can only trace individuals with infection or death. For those who are not infected, it doesn't mean they will not be infected. So their outcomes are still unknown.
+<br>&emsp;&emsp;Even if we can overcome such difficulty, infection rate and death rate are influenced by a lot of factors and therefore are very unstable. But if we compute the efficacy, reduction rate of infection rate and death rate, many impacts are offset so the data are much more stable and the results would be much more reliable.
+<br>&emsp;&emsp;Based on all above, we do not use causal inference even if it is a very useful tool for treatment effect models.
+
+# Implementation
+## Daily Death Rate Model
+&emsp;&emsp;We first take all our 15 variable and fit our model. We can see that people_vaccinated_per_hundred, aged_65_older, loggdp and hospital_beds_per_thousand are not significant. This may be due to colinearity. Also, cardiovasc_death_rate has very small coefficient while it is high correlated with life_expectancy. So, we can drop such variables.
+<br>&emsp;&emsp;Here is our final model.
+
+```{r warning=FALSE, echo=FALSE, include=FALSE}
+fit1 = gam(cbind(death,case10)~reproduction_rate+people_vaccinated_per_hundred+people_fully_vaccinated_per_hundred+total_boosters_per_hundred+median_age+aged_65_older+aged_70_older+loggdp+extreme_poverty+cardiovasc_death_rate+diabetes_prevalence+hospital_beds_per_thousand+life_expectancy+human_development_index+s(date_numeric),family=binomial(), data=data3, select=TRUE)
+summary(fit1)
+```
+
+```{r warning=FALSE, echo=FALSE, include=FALSE}
+fit22 = gam(cbind(death,case10)~reproduction_rate+people_fully_vaccinated_per_hundred+total_boosters_per_hundred+median_age+aged_70_older+extreme_poverty+diabetes_prevalence+life_expectancy+human_development_index,family=binomial(), data=data3, select=TRUE)
+summary(fit22)
+```
+```{r warning=FALSE, echo=FALSE, include=FALSE}
+fit21 = gam(cbind(death,case10)~reproduction_rate+people_fully_vaccinated_per_hundred+total_boosters_per_hundred+median_age+aged_70_older+extreme_poverty+diabetes_prevalence+life_expectancy+human_development_index+date_numeric,family=binomial(), data=data3, select=TRUE)
+summary(fit21)
+```
+
+```{r warning=FALSE, echo=FALSE, include=FALSE}
+fit2 = gam(cbind(death,case10)~reproduction_rate+people_fully_vaccinated_per_hundred+total_boosters_per_hundred+median_age+aged_70_older+extreme_poverty+diabetes_prevalence+life_expectancy+human_development_index+s(date_numeric),family=binomial(), data=data3, select=TRUE)
+summary(fit2)
+```
+
+```{r echo=FALSE}
+library(knitr)
+library(kableExtra)
+df1 = data.frame(Variable = unname(c(names(fit2$coefficients[1:10]),"s(date_numeric)")), 
+                 Fit = unname(c(round(fit2$coefficients[1:10],4),"")), 
+                 P_value = unname(rep("<0.001",11)))
+df1 %>%
+  kbl() %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+```
+<br>&emsp;&emsp;From the table above, we can see vaccine rate decrease the death rate while booster rate largely decreases death rate. We also find reproduction number decreases the risk of death. This may be explained by the guess that Covid-19 variants tend to be milder when having higher infection speed, like omicron vs delta. Life expectancy and human development index also reduce risk of death.
+<br>&emsp;&emsp;Median age and percent of 70 older increase the risk of death. This is because older population has poor immune system. Extreme poverty rate also increases the risk, because countries with higher extreme poverty rate tend to have worse health care system. And diabetes prevalence increases the risk. This may indicate diabetes patients are more vulnerable to Covid-19.
+
+```{r echo=FALSE, fig.height=4, fig.width=6, fig.align ='center'}
+date1 = start_date + 350
+date2 = start_date + 600
+plot(fit2,select=1, xlab="Days from 3/8/2020", ylab="Estimated Effect", main="Effect of Date on Death Rate")
+abline(v=350, col="red", lty=2)
+text(350, 0.5, "2/21/2021\nAlpha Variant",cex=0.8)
+abline(v=600, col="blue", lty=2)
+text(600, 0.3, "10/29/2021\nDelta Variant",cex=0.8)
+```
+<br>&emsp;&emsp;We can also observe decreasing tend of death rate among time, while there are two rebounds. The first is about 2/21/2021, when Alpha variant dominated. And the second is for Delta in 10/29/2021. We can check such trend with death numbers of US [6]. 
+<br>&emsp;&emsp;We also compare our models with binomial regression. We measure their performance by deviance explained, one kind of pseudo R-sqaure.
+```{r, echo=FALSE}
+df2 = data.frame(Model = c("GAM","Logistic Regression","Logistic Regression without Date"), 
+                 Deviance_Explained = c("70.5%","62.2%","53.2%"))
+df2 %>%
+  kbl() %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+```
+&emsp;&emsp;So we can find our model outperforms others. This indicates both date and introduction of nonlinearity largely increase model performance.
+
+## Vaccine Efficacy Model
+&emsp;&emsp;We first study efficacy against infection.
+```{r echo=FALSE, warning=FALSE, include=FALSE}
+fit_case = gam(efficacy~age_group+s(week_no),family=quasibinomial(), data=us_data)
+summary(fit_case)
+```
+```{r echo=FALSE}
+library(knitr)
+library(kableExtra)
+df3 = data.frame(Variable = unname(c(names(fit_case$coefficients[1:6]),"s(week_no)")), 
+                 Fit = unname(c(round(fit_case$coefficients[1:6],4),"")), 
+                 P_value = unname(rep("<0.05",7)))
+df3 %>%
+  kbl() %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+```
+<br>&emsp;&emsp;We can see vaccine protect 65-79 group the best. This is maybe because younger groups have stronger immune system so the protection may be less obvious while 80+ group cannot be well-protected.
+```{r echo=FALSE, fig.height=4, fig.width=6, fig.align ='center'}
+plot(fit_case, select=1, xlab="Week Number of 2021", ylab="Effect on Efficacy", main="Effect of Week Number on Efficacy of Infection")
+```
+<br>&emsp;&emsp;We can also find waning efficacy against infection of with time.
+<br><br>&emsp;&emsp;Then we model efficacy against death.
+```{r warning=FALSE, echo=FALSE, include=FALSE}
+fit_death = gam(efficacy~age_group+s(week_no),family=quasibinomial(), data=us_data_death, select=TRUE)
+summary(fit_death)
+```
+
+```{r echo=FALSE}
+library(knitr)
+library(kableExtra)
+df4 = data.frame(Variable = unname(c(names(fit_death$coefficients[1:6]),"s(week_no)")), 
+                 Fit = unname(c(round(fit_case$coefficients[1:6],4),"")), 
+                 P_value = c("<2e-16","0.0003","0.4229","0.9703","0.9362","1.07e-08","0.0059"))
+df4 %>%
+  kbl() %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+```
+```{r echo=FALSE, fig.height=4, fig.width=6, fig.align ='center'}
+plot(fit_death, select=1, xlab="Week Number of 2021", ylab="Effect on Efficacy", main="Effect of Week Number on Efficacy of Death")
+```
+<br>&emsp;&emsp;We can observe 80+ group is the least protected. Also efficacy seems to first decrease and then rebound. This suggests efficacy against death is better perserved than efficacy against infection.
+
+# Model diagnostics
+## Daily Death Rate Model
+&emsp;&emsp;Since in our model, we do not have normality assumption, it is meaningless to plot residual QQ plot. Instead, we plot Pearson/deviance residual vs fitted value plot. Then we check influential points.
+<br>&emsp;&emsp;We first plot the residual v.s. fitted plot.
+```{r echo=FALSE, fig.height=4, fig.width=6, fig.align ='center'}
+residual.P = residuals(fit2, type="pearson")
+residual.D = residuals(fit2, type="deviance")
+fitted = fitted.values(fit2)
+quan_99 = quantile(fitted,0.95)
+fitted = fitted.values(fit2)
+plot(fitted, residual.P, yaxt="n",ylab="Pearson Residual", xlab="Fitted Value", main="Pearson Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted, residual.P, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+abline(v=quan_99, lty=2, col="green")
+axis(2, ylim=c(-6,8),col="black",las=1)
+par(new = TRUE) 
+plot(density(fitted), col="blue", lwd=2, axes=FALSE, ylab="", xlab="", main="")
+axis(4, ylim=c(0,70), col="blue", col.axis="blue", las=1)
+legend("topright",legend=c("fitted pattern","fitted density","95% quantile of fitted"),
+  text.col=c("red","blue", "green"), lty = c(1,1,2), col=c("red","blue","green"))
+```
+
+```{r echo=FALSE, fig.height=4, fig.width=6, fig.align ='center'}
+plot(fitted, residual.D, yaxt="n",ylab="Deviance Residual", xlab="Fitted Value", main="Deviance Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted, residual.D, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+abline(v=quan_99, lty=2, col="green")
+axis(2, ylim=c(-6,8),col="black",las=1)
+par(new = TRUE) 
+plot(density(fitted), col="blue", lwd=2, axes=FALSE, ylab="", xlab="", main="")
+axis(4, ylim=c(0,70), col="blue", col.axis="blue", las=1)
+legend("topright",legend=c("fitted pattern","fitted density","95% quantile of fitted"),
+  text.col=c("red","blue", "green"), lty = c(1,1,2), col=c("red","blue","green"))
+```
+<br>&emsp;&emsp;We can see the right tails of the plots seem to have some pattern among fitted values and fall below 0. However, they only consist of very small portion of data and the reason for this pattern is low quality of data when high death rate emerges. We cannot fix this problem and since most data show no pattern, we can assert there is no lack of fit. That's, we can accept such residual plots.
+
+```{r echo=FALSE, fig.height=4, fig.width=8, fig.align ='center'}
+p = length(coef(fit2))
+n = nrow(data3)
+leverage = influence.gam(fit2)
+cooks = cooks.distance(fit2)
+par(mfrow=c(1,2))
+plot(leverage, xlab="", ylab="Leverage")
+abline(h=2*p/n, col=2, lwd=2, lty=2)
+
+plot(cooks, xlab="",ylab="Cook's Distance")
+abline(h=4/n,col=2,lwd=2,lty=2)
+```
+<br>&emsp;&emsp;We can observe 2989 high influence points. We delete them and refit the data. However, we cannot observe major difference between the two model. This suggests such influential points have little overall influence on our model.
+```{r warning=FALSE, include=FALSE, echo=FALSE}
+data4 = data3[as.logical((leverage<2*p/n) * (cooks<4/n)),]
+fit3 = gam(cbind(death,case10)~reproduction_rate+people_fully_vaccinated_per_hundred+total_boosters_per_hundred+median_age+aged_70_older+extreme_poverty+diabetes_prevalence+life_expectancy+human_development_index+s(date_numeric),family=binomial(), data=data4)
+summary(fit3)
+residual.P1 = residuals(fit3, type="pearson")
+residual.D1 = residuals(fit3, type="deviance")
+fitted1 = fitted.values(fit3)
+quan_99_1 = quantile(fitted1,0.95)
+plot(fitted1, residual.P1, yaxt="n",ylab="Pearson Residual", xlab="Fitted Value", main="Pearson Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted1, residual.P1, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+abline(v=quan_99_1, lty=2, col="green")
+axis(2, ylim=c(-6,8),col="black",las=1)
+par(new = TRUE) 
+plot(density(fitted1), col="blue", lwd=2, axes=FALSE, ylab="", xlab="", main="")
+axis(4, ylim=c(0,70), col="blue", col.axis="blue", las=1)
+legend("topright",legend=c("fitted pattern","fitted density","95% quantile of fitted"),
+  text.col=c("red","blue", "green"), lty = c(1,1,2), col=c("red","blue","green"))
+plot(fitted1, residual.D1, yaxt="n",ylab="Deviance Residual", xlab="Fitted Value", main="Deviance Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted1, residual.D1, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+abline(v=quan_99_1, lty=2, col="green")
+axis(2, ylim=c(-6,8),col="black",las=1)
+par(new = TRUE) 
+plot(density(fitted1), col="blue", lwd=2, axes=FALSE, ylab="", xlab="", main="")
+axis(4, ylim=c(0,70), col="blue", col.axis="blue", las=1)
+legend("topright",legend=c("fitted pattern","fitted density","95% quantile of fitted"),
+  text.col=c("red","blue", "green"), lty = c(1,1,2), col=c("red","blue","green"))
+```
+
+## Vaccine Efficacy Model
+```{r echo=FALSE, fig.height=6, fig.width=8, fig.align ='center'}
+par(mfrow=c(2,2))
+residual.P_case = residuals(fit_case, type="pearson")
+residual.D_case = residuals(fit_case, type="deviance")
+fitted_case = fitted.values(fit_case)
+plot(fitted_case, residual.P_case, yaxt="n",ylab="Pearson Residual", xlab="Fitted Value", main="Pearson Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted_case, residual.P_case, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+plot(fitted_case, residual.D_case, yaxt="n",ylab="Deviance Residual", xlab="Fitted Value", main="Deviance Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted_case, residual.D_case, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+p_case = length(coef(fit_case))
+n_case = nrow(us_data)
+leverage_case = influence.gam(fit_case)
+cooks_case = cooks.distance(fit_case)
+plot(leverage_case, xlab="", ylab="Leverage")
+abline(h=2*p_case/n_case, col=2, lwd=2, lty=2)
+plot(cooks_case, xlab="",ylab="Cook's Distance")
+abline(h=4/n_case,col=2,lwd=2,lty=2)
+```
+<br>&emsp;&emsp;we can observe vaccine efficacy against infection model has desired residual plots and few influential points.
+```{r echo=FALSE, fig.height=6, fig.width=8, fig.align ='center'}
+par(mfrow=c(2,2))
+residual.P_death = residuals(fit_death, type="pearson")
+residual.D_death = residuals(fit_death, type="deviance")
+fitted_death = fitted.values(fit_death)
+plot(fitted_death, residual.P_death, yaxt="n",ylab="Pearson Residual", xlab="Fitted Value", main="Pearson Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted_death, residual.P_death, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+plot(fitted_death, residual.D_death, yaxt="n",ylab="Deviance Residual", xlab="Fitted Value", main="Deviance Residuals v.s. Fitted Values")
+lines(smooth.spline(fitted_death, residual.D_death, spar=0.9), col=2)
+abline(h=0, lty=2, col='grey')
+p_death = length(coef(fit_death))
+n_death = nrow(us_data_death)
+leverage_death = influence.gam(fit_death)
+cooks_death = cooks.distance(fit_death)
+plot(leverage_death, xlab="", ylab="Leverage")
+abline(h=2*p_death/n_death, col=2, lwd=2, lty=2)
+plot(cooks_death, xlab="",ylab="Cook's Distance")
+abline(h=4/n_death,col=2,lwd=2,lty=2)
+```
+<br>&emsp;&emsp;Model diagnostics also show no evidence of violation of assumptions in vaccine efficacy against death model .
+
+# Discussion
+## Conclusion
+&emsp;&emsp;Vaccine rate decreases death rate significantly. Richer and more developed countries also tend to lower death rate. The older and those having diabetes should be taken special care of since they have higher death rate. Also, inner death rate shows an overall decline while there are two major rebounds in Alpha and Delta waves.
+<br>&emsp;&emsp;Vaccine efficacy against infection decreases with time while efficacy against death shows first decreasing and increasing trend, indicating vaccine has long-term protection against death despite waning protection against infection. However, both efficacy decline for 80+ age group, also indicating the older are much more vulnerable even with vaccines.
+
+## Limitation
+&emsp;&emsp;We only study countries of relative high development due to data quality. However, such selection would cause biased distribution in some variables so our results may be limited to such countries. Better techniques or data are need to get a more universal study.
+
+# Reference {-}
+[1] https://github.com/owid/covid-19-data/tree/master/public/data
+<br>[2] https://data.cdc.gov/Public-Health-Surveillance/Rates-of-COVID-19-Cases-or-Deaths-by-Age-Group-and/3rge-nu2a
+<br>[3] Hastie, Trevor J., and Robert J. Tibshirani. Generalized additive models. Routledge, 2017.
+<br>[4] https://en.wikipedia.org/wiki/Generalized_additive_model
+<br>[5] Hans-Georg Müller, STA223 Generalize Linear Model notes
+<br>[6] https://www.worldometers.info/coronavirus/country/us/
+
+# Acknowledge {-}
+&emsp;&emsp;I main discussion this project with Chenyang Zhang, Ziqin Wang and my teammates. I also thank Zitong Zhang for guidance on my report. Finally, I thank Dr. Chen for all informative course materials and his enthusiastic teaching.
+
+# Session Info {-}
+```{r echo=FALSE}
+sessionInfo()
+```
